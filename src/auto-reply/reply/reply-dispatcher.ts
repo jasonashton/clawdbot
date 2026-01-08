@@ -52,8 +52,10 @@ function normalizeReplyPayload(
   const hasMedia = Boolean(
     payload.mediaUrl || (payload.mediaUrls?.length ?? 0) > 0,
   );
+  const hasButtons = Boolean(payload.buttons?.length);
   const trimmed = payload.text?.trim() ?? "";
-  if (!trimmed && !hasMedia) return null;
+  // Keep payloads that have buttons even if no text/media
+  if (!trimmed && !hasMedia && !hasButtons) return null;
 
   // Avoid sending the explicit silent token when no media is attached.
   if (trimmed === SILENT_REPLY_TOKEN && !hasMedia) return null;
@@ -62,6 +64,10 @@ function normalizeReplyPayload(
   if (text && !trimmed) {
     // Keep empty text when media exists so media-only replies still send.
     text = "";
+  }
+  // If we have buttons but no text, add minimal text (Telegram requires it)
+  if (hasButtons && !trimmed && !hasMedia) {
+    text = "⬇️"; // Minimal visible text for button-only messages
   }
   if (text?.includes(HEARTBEAT_TOKEN)) {
     const stripped = stripHeartbeatToken(text, { mode: "message" });

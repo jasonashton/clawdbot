@@ -19,7 +19,7 @@ import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
-import type { OriginatingChannelType, TemplateContext } from "../templating.js";
+import type { TemplateContext } from "../templating.js";
 import { normalizeVerboseLevel, type VerboseLevel } from "../thinking.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
@@ -31,6 +31,7 @@ import {
   type QueueSettings,
   scheduleFollowupDrain,
 } from "./queue.js";
+import { extractButtonTags, stripButtonSyntaxFragments } from "./button-tags.js";
 import {
   applyReplyTagsToPayload,
   applyReplyThreading,
@@ -44,7 +45,6 @@ import {
 } from "./reply-threading.js";
 import { incrementCompactionCount } from "./session-updates.js";
 import type { TypingController } from "./typing.js";
-import { createTypingSignaler } from "./typing-mode.js";
 
 const BUN_FETCH_SOCKET_ERROR_RE = /socket connection was closed unexpectedly/i;
 
@@ -119,11 +119,26 @@ export async function runReplyAgent(params: {
   } = params;
 
   const isHeartbeat = opts?.isHeartbeat === true;
-  const typingSignals = createTypingSignaler({
-    typing,
-    mode: typingMode,
-    isHeartbeat,
-  });
+  const shouldStartTypingOnText =
+    typingMode === "message" || typingMode === "instant";
+  const shouldStartTypingOnReasoning = typingMode === "thinking";
+
+  const signalTypingFromText = async (text?: string) => {
+    if (isHeartbeat || typingMode === "never") return;
+    if (shouldStartTypingOnText) {
+      await typing.startTypingOnText(text);
+      return;
+    }
+    if (shouldStartTypingOnReasoning) {
+      typing.refreshTypingTtl();
+    }
+  };
+
+  const signalTypingFromReasoning = async () => {
+    if (isHeartbeat || !shouldStartTypingOnReasoning) return;
+    await typing.startTypingLoop();
+    typing.refreshTypingTtl();
+  };
 
   const shouldEmitToolResult = () => {
     if (!sessionKey || !storePath) {
@@ -145,6 +160,7 @@ export async function runReplyAgent(params: {
   const pendingBlockTasks = new Set<Promise<void>>();
   const pendingToolTasks = new Set<Promise<void>>();
   let didStreamBlockReply = false;
+  let detectedButtonSyntax = false; // Stop streaming once buttons are detected
   const buildPayloadKey = (payload: ReplyPayload) => {
     const text = payload.text?.trim() ?? "";
     const mediaList = payload.mediaUrls?.length
@@ -158,16 +174,6 @@ export async function runReplyAgent(params: {
       replyToId: payload.replyToId ?? null,
     });
   };
-  const replyToChannel =
-    sessionCtx.OriginatingChannel ??
-    ((sessionCtx.Surface ?? sessionCtx.Provider)?.toLowerCase() as
-      | OriginatingChannelType
-      | undefined);
-  const replyToMode = resolveReplyToMode(
-    followupRun.run.config,
-    replyToChannel,
-  );
-  const applyReplyToMode = createReplyToModeFilter(replyToMode);
 
   if (shouldSteer && isStreaming) {
     const steered = queueEmbeddedPiMessage(
@@ -284,7 +290,7 @@ export async function runReplyAgent(params: {
                       }
                       text = stripped.text;
                     }
-                    await typingSignals.signalTextDelta(text);
+                    await signalTypingFromText(text);
                     await opts.onPartialReply?.({
                       text,
                       mediaUrls: payload.mediaUrls,
@@ -292,9 +298,9 @@ export async function runReplyAgent(params: {
                   }
                 : undefined,
             onReasoningStream:
-              typingSignals.shouldStartOnReasoning || opts?.onReasoningStream
+              shouldStartTypingOnReasoning || opts?.onReasoningStream
                 ? async (payload) => {
-                    await typingSignals.signalReasoningDelta();
+                    await signalTypingFromReasoning();
                     await opts?.onReasoningStream?.({
                       text: payload.text,
                       mediaUrls: payload.mediaUrls,
@@ -324,6 +330,15 @@ export async function runReplyAgent(params: {
               blockStreamingEnabled && opts?.onBlockReply
                 ? async (payload) => {
                     let text = payload.text;
+                    // Once button syntax is detected, stop all streaming and let final processing handle it
+                    if (detectedButtonSyntax) {
+                      return;
+                    }
+                    // Detect button syntax and stop streaming from this point
+                    if (text?.includes("[[buttons") || text?.includes("[[/buttons") || /\[[^\]|]+\|[^\]]+\]/.test(text || "")) {
+                      detectedButtonSyntax = true;
+                      return;
+                    }
                     if (!isHeartbeat && text?.includes("HEARTBEAT_OK")) {
                       const stripped = stripHeartbeatToken(text, {
                         mode: "message",
@@ -347,8 +362,12 @@ export async function runReplyAgent(params: {
                       sessionCtx.MessageSid,
                     );
                     if (!isRenderablePayload(taggedPayload)) return;
+                    // Extract audio tags
                     const audioTagResult = extractAudioTag(taggedPayload.text);
-                    const cleaned = audioTagResult.cleaned || undefined;
+                    // Also extract button tags to clean the text (buttons themselves
+                    // are only sent with final payload, not during block streaming)
+                    const buttonResult = extractButtonTags(audioTagResult.cleaned);
+                    const cleaned = buttonResult.cleaned || undefined;
                     const hasMedia =
                       Boolean(taggedPayload.mediaUrl) ||
                       (taggedPayload.mediaUrls?.length ?? 0) > 0;
@@ -369,7 +388,7 @@ export async function runReplyAgent(params: {
                     }
                     pendingStreamedPayloadKeys.add(payloadKey);
                     const task = (async () => {
-                      await typingSignals.signalTextDelta(taggedPayload.text);
+                      await signalTypingFromText(cleaned);
                       await opts.onBlockReply?.(blockPayload);
                     })()
                       .then(() => {
@@ -414,7 +433,7 @@ export async function runReplyAgent(params: {
                       }
                       text = stripped.text;
                     }
-                    await typingSignals.signalTextDelta(text);
+                    await signalTypingFromText(text);
                     await opts.onToolResult?.({
                       text,
                       mediaUrls: payload.mediaUrls,
@@ -531,25 +550,47 @@ export async function runReplyAgent(params: {
           return [{ ...payload, text: stripped.text }];
         });
 
+    // First, join all text payloads to extract buttons from the complete text
+    // (buttons syntax may span multiple payloads due to streaming chunks)
+    const allText = sanitizedPayloads
+      .map((p) => p.text ?? "")
+      .join("\n")
+      .trim();
+    const { buttons: extractedButtons } = extractButtonTags(allText);
+
+    // Apply reply threading, then audio tags, then button cleanup
     const replyTaggedPayloads: ReplyPayload[] = applyReplyThreading({
       payloads: sanitizedPayloads,
       applyReplyToMode,
       currentMessageId: sessionCtx.MessageSid,
     })
-      .map((payload) => {
+      .map((payload, index) => {
+        // Extract audio tags
         const audioTagResult = extractAudioTag(payload.text);
+        // Strip button syntax from text (buttons attached separately)
+        let finalText = audioTagResult.cleaned;
+        if (extractedButtons?.length) {
+          finalText = stripButtonSyntaxFragments(finalText);
+        }
+        const isLastPayload = index === sanitizedPayloads.length - 1;
         return {
           ...payload,
-          text: audioTagResult.cleaned ? audioTagResult.cleaned : undefined,
+          text: finalText ? finalText : undefined,
           audioAsVoice: audioTagResult.audioAsVoice,
+          // Attach buttons to the last payload only
+          buttons: isLastPayload ? extractedButtons : undefined,
         };
       })
-      .filter(isRenderablePayload);
+      .filter(
+        (payload) =>
+          payload.text ||
+          payload.mediaUrl ||
+          (payload.mediaUrls && payload.mediaUrls.length > 0) ||
+          payload.buttons?.length,
+      );
 
-    // Drop final payloads if block streaming is enabled and we already streamed
-    // block replies. Tool-sent duplicates are filtered below.
     const shouldDropFinalPayloads =
-      blockStreamingEnabled && didStreamBlockReply;
+      blockStreamingEnabled && didStreamBlockReply && !detectedButtonSyntax;
     const messagingToolSentTexts = runResult.messagingToolSentTexts ?? [];
     const messagingToolSentTargets = runResult.messagingToolSentTargets ?? [];
     const suppressMessagingToolReplies = shouldSuppressMessagingToolReplies({
@@ -562,11 +603,23 @@ export async function runReplyAgent(params: {
       payloads: replyTaggedPayloads,
       sentTexts: messagingToolSentTexts,
     });
-    const filteredPayloads = shouldDropFinalPayloads
-      ? []
+    // When block streaming has sent text but we have buttons to send,
+    // create a buttons-only payload with minimal text (text was already streamed)
+    // BUT: if button syntax was detected, text wasn't streamed, so don't drop it
+    const filteredPayloads: ReplyPayload[] = shouldDropFinalPayloads
+      ? dedupedPayloads
+          .filter((payload) => payload.buttons?.length)
+          .map((payload) => ({
+            // Minimal text required to attach buttons (Telegram needs some content)
+            text: "⬇️",
+            buttons: payload.buttons,
+            replyToId: payload.replyToId,
+          }))
       : blockStreamingEnabled
         ? dedupedPayloads.filter(
-            (payload) => !streamedPayloadKeys.has(buildPayloadKey(payload)),
+            (payload) =>
+              !streamedPayloadKeys.has(buildPayloadKey(payload)) ||
+              payload.buttons?.length,
           )
         : dedupedPayloads;
     const replyPayloads = suppressMessagingToolReplies ? [] : filteredPayloads;
@@ -580,8 +633,8 @@ export async function runReplyAgent(params: {
       if (payload.mediaUrls && payload.mediaUrls.length > 0) return true;
       return false;
     });
-    if (shouldSignalTyping) {
-      await typingSignals.signalRunStart();
+    if (shouldSignalTyping && typingMode === "instant" && !isHeartbeat) {
+      await typing.startTypingLoop();
     }
 
     if (sessionStore && sessionKey) {

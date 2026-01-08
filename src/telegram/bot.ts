@@ -1,10 +1,11 @@
 // @ts-nocheck
 import { Buffer } from "node:buffer";
+import fs from "node:fs";
 
 import { sequentialize } from "@grammyjs/runner";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
 import type { ApiClientOptions, Message } from "grammy";
-import { Bot, InputFile, webhookCallback } from "grammy";
+import { Bot, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import { EmbeddedBlockChunker } from "../agents/pi-embedded-block-chunker.js";
 import {
   chunkMarkdownText,
@@ -17,6 +18,7 @@ import {
 } from "../auto-reply/commands-registry.js";
 import { formatAgentEnvelope } from "../auto-reply/envelope.js";
 import { resolveBlockStreamingChunking } from "../auto-reply/reply/block-streaming.js";
+import { extractButtonTags } from "../auto-reply/reply/button-tags.js";
 import { dispatchReplyFromConfig } from "../auto-reply/reply/dispatch-from-config.js";
 import {
   buildMentionRegexes,
@@ -24,7 +26,7 @@ import {
 } from "../auto-reply/reply/mentions.js";
 import { createReplyDispatcherWithTyping } from "../auto-reply/reply/reply-dispatcher.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
-import type { ReplyPayload } from "../auto-reply/types.js";
+import type { InlineButtonRow, ReplyPayload } from "../auto-reply/types.js";
 import type { ClawdbotConfig, ReplyToMode } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
 import {
@@ -50,7 +52,6 @@ import {
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { loadWebMedia } from "../web/media.js";
-import { resolveTelegramAccount } from "./accounts.js";
 import { createTelegramDraftStream } from "./draft-stream.js";
 import { resolveTelegramFetch } from "./fetch.js";
 import { markdownToTelegramHtml } from "./format.js";
@@ -108,7 +109,6 @@ type TelegramContext = {
 
 export type TelegramBotOptions = {
   token: string;
-  accountId?: string;
   runtime?: RuntimeEnv;
   requireMention?: boolean;
   allowFrom?: Array<string | number>;
@@ -163,19 +163,14 @@ export function createTelegramBot(opts: TelegramBotOptions) {
   const mediaGroupBuffer = new Map<string, MediaGroupEntry>();
 
   const cfg = opts.config ?? loadConfig();
-  const account = resolveTelegramAccount({
-    cfg,
-    accountId: opts.accountId,
-  });
-  const telegramCfg = account.config;
-  const textLimit = resolveTextChunkLimit(cfg, "telegram", account.accountId);
-  const dmPolicy = telegramCfg.dmPolicy ?? "pairing";
-  const allowFrom = opts.allowFrom ?? telegramCfg.allowFrom;
+  const textLimit = resolveTextChunkLimit(cfg, "telegram");
+  const dmPolicy = cfg.telegram?.dmPolicy ?? "pairing";
+  const allowFrom = opts.allowFrom ?? cfg.telegram?.allowFrom;
   const groupAllowFrom =
     opts.groupAllowFrom ??
-    telegramCfg.groupAllowFrom ??
-    (telegramCfg.allowFrom && telegramCfg.allowFrom.length > 0
-      ? telegramCfg.allowFrom
+    cfg.telegram?.groupAllowFrom ??
+    (cfg.telegram?.allowFrom && cfg.telegram.allowFrom.length > 0
+      ? cfg.telegram.allowFrom
       : undefined) ??
     (opts.allowFrom && opts.allowFrom.length > 0 ? opts.allowFrom : undefined);
   const normalizeAllowFrom = (list?: Array<string | number>) => {
@@ -215,15 +210,15 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       (entry) => entry === username || entry === `@${username}`,
     );
   };
-  const replyToMode = opts.replyToMode ?? telegramCfg.replyToMode ?? "first";
-  const streamMode = resolveTelegramStreamMode(telegramCfg);
+  const replyToMode = opts.replyToMode ?? cfg.telegram?.replyToMode ?? "off";
+  const streamMode = resolveTelegramStreamMode(cfg);
   const nativeEnabled = cfg.commands?.native === true;
   const nativeDisabledExplicit = cfg.commands?.native === false;
   const useAccessGroups = cfg.commands?.useAccessGroups !== false;
   const ackReaction = (cfg.messages?.ackReaction ?? "").trim();
   const ackReactionScope = cfg.messages?.ackReactionScope ?? "group-mentions";
   const mediaMaxBytes =
-    (opts.mediaMaxMb ?? telegramCfg.mediaMaxMb ?? 5) * 1024 * 1024;
+    (opts.mediaMaxMb ?? cfg.telegram?.mediaMaxMb ?? 5) * 1024 * 1024;
   const logger = getChildLogger({ module: "telegram-auto-reply" });
   const mentionRegexes = buildMentionRegexes(cfg);
   let botHasTopicsEnabled: boolean | undefined;
@@ -247,7 +242,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     resolveProviderGroupPolicy({
       cfg,
       provider: "telegram",
-      accountId: account.accountId,
       groupId: String(chatId),
     });
   const resolveGroupActivation = (params: {
@@ -275,7 +269,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     resolveProviderGroupRequireMention({
       cfg,
       provider: "telegram",
-      accountId: account.accountId,
       groupId: String(chatId),
       requireMentionOverride: opts.requireMention,
       overrideOrder: "after-config",
@@ -284,7 +277,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     chatId: string | number,
     messageThreadId?: number,
   ) => {
-    const groups = telegramCfg.groups;
+    const groups = cfg.telegram?.groups;
     if (!groups) return { groupConfig: undefined, topicConfig: undefined };
     const groupKey = String(chatId);
     const groupConfig = groups[groupKey] ?? groups["*"];
@@ -316,7 +309,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     const route = resolveAgentRoute({
       cfg,
       provider: "telegram",
-      accountId: account.accountId,
       peer: {
         kind: isGroup ? "group" : "dm",
         id: peerId,
@@ -663,9 +655,11 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     const updateDraftFromPartial = (text?: string) => {
       if (!draftStream || !text) return;
       if (text === lastPartialText) return;
+      // Strip button tags from draft display (buttons sent with final message)
+      const { cleaned: displayText } = extractButtonTags(text);
       if (streamMode === "partial") {
         lastPartialText = text;
-        draftStream.update(text);
+        draftStream.update(displayText || text);
         return;
       }
       let delta = text;
@@ -679,7 +673,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       lastPartialText = text;
       if (!delta) return;
       if (!draftChunker) {
-        draftText = text;
+        draftText = displayText || text;
         draftStream.update(draftText);
         return;
       }
@@ -702,10 +696,17 @@ export function createTelegramBot(opts: TelegramBotOptions) {
           },
         });
         draftChunker.reset();
-        if (draftText) draftStream.update(draftText);
+        if (draftText) {
+          // Strip button tags from final draft (buttons sent separately)
+          const { cleaned } = extractButtonTags(draftText);
+          draftStream.update(cleaned || draftText);
+        }
       }
       await draftStream.flush();
     };
+
+    // Track last sent message ID for button editing after block streaming
+    let lastSentMessageId: number | undefined;
 
     const { dispatcher, replyOptions, markDispatchIdle } =
       createReplyDispatcherWithTyping({
@@ -715,7 +716,26 @@ export function createTelegramBot(opts: TelegramBotOptions) {
             await flushDraft();
             draftStream?.stop();
           }
-          await deliverReplies({
+          // If this is a buttons-only payload (text is placeholder) and we have a last message,
+          // edit that message to add buttons instead of sending a new one
+          if (
+            payload.buttons?.length &&
+            payload.text === "⬇️" &&
+            lastSentMessageId
+          ) {
+            try {
+              await bot.api.editMessageReplyMarkup(
+                chatId,
+                lastSentMessageId,
+                { reply_markup: buildInlineKeyboard(payload.buttons) },
+              );
+              return;
+            } catch (err) {
+              // If edit fails, fall through to send as new message
+              runtime.log?.(`Failed to edit message for buttons: ${String(err)}`);
+            }
+          }
+          const messageId = await deliverReplies({
             replies: [payload],
             chatId: String(chatId),
             token: opts.token,
@@ -725,6 +745,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
             textLimit,
             messageThreadId,
           });
+          if (messageId) lastSentMessageId = messageId;
         },
         onError: (err, info) => {
           runtime.error?.(
@@ -827,7 +848,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         }
 
         if (isGroup && useAccessGroups) {
-          const groupPolicy = telegramCfg.groupPolicy ?? "open";
+          const groupPolicy = cfg.telegram?.groupPolicy ?? "open";
           if (groupPolicy === "disabled") {
             await bot.api.sendMessage(
               chatId,
@@ -894,7 +915,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         const route = resolveAgentRoute({
           cfg,
           provider: "telegram",
-          accountId: account.accountId,
           peer: {
             kind: isGroup ? "group" : "dm",
             id: isGroup
@@ -1023,7 +1043,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         // - "open" (default): groups bypass allowFrom, only mention-gating applies
         // - "disabled": block all group messages entirely
         // - "allowlist": only allow group messages from senders in groupAllowFrom/allowFrom
-        const groupPolicy = telegramCfg.groupPolicy ?? "open";
+        const groupPolicy = cfg.telegram?.groupPolicy ?? "open";
         if (groupPolicy === "disabled") {
           logVerbose(`Blocked telegram group message (groupPolicy: disabled)`);
           return;
@@ -1126,6 +1146,159 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     }
   });
 
+  // Handle inline button callbacks
+  bot.on("callback_query:data", async (ctx) => {
+    try {
+      const callbackQuery = ctx.callbackQuery;
+      const data = callbackQuery.data;
+      const chatId = callbackQuery.message?.chat.id;
+      const messageId = callbackQuery.message?.message_id;
+      const senderId = callbackQuery.from.id ? String(callbackQuery.from.id) : "";
+      const senderUsername = callbackQuery.from.username ?? "";
+
+      if (!chatId) {
+        await ctx.answerCallbackQuery({ text: "Error: no chat context" });
+        return;
+      }
+
+      // Answer the callback with brief visual confirmation
+      await ctx.answerCallbackQuery({ text: `✓ ${data}` });
+
+      // Check access control
+      const storeAllowFrom = await readTelegramAllowFromStore().catch(() => []);
+      const isGroup =
+        callbackQuery.message?.chat.type === "group" ||
+        callbackQuery.message?.chat.type === "supergroup";
+      const effectiveAllow = normalizeAllowFrom([
+        ...(isGroup ? (groupAllowFrom ?? []) : (allowFrom ?? [])),
+        ...storeAllowFrom,
+      ]);
+
+      const commandAuthorized = isSenderAllowed({
+        allow: effectiveAllow,
+        senderId,
+        senderUsername,
+      });
+
+      if (!commandAuthorized && effectiveAllow.hasEntries) {
+        logVerbose(
+          `Blocked telegram callback from unauthorized sender ${senderId}`,
+        );
+        return;
+      }
+
+      const messageThreadId = (callbackQuery.message as { message_thread_id?: number })
+        ?.message_thread_id;
+      const isForum =
+        (callbackQuery.message?.chat as { is_forum?: boolean })?.is_forum === true;
+
+      // Build the callback body - treat button press as a message
+      const senderName = [callbackQuery.from.first_name, callbackQuery.from.last_name]
+        .filter(Boolean)
+        .join(" ")
+        .trim() || callbackQuery.from.username || "Unknown";
+
+      const body = formatAgentEnvelope({
+        provider: "Telegram",
+        from: isGroup
+          ? `${callbackQuery.message?.chat.title ?? `group:${chatId}`} from ${senderName} id:${senderId}`
+          : `${senderName} id:${senderId}`,
+        timestamp: Date.now(),
+        body: `[Button pressed: ${data}]`,
+      });
+
+      const route = resolveAgentRoute({
+        cfg,
+        provider: "telegram",
+        peer: {
+          kind: isGroup ? "group" : "dm",
+          id: isGroup
+            ? buildTelegramGroupPeerId(chatId, messageThreadId)
+            : String(chatId),
+        },
+      });
+
+      const ctxPayload = {
+        Body: body,
+        From: isGroup
+          ? buildTelegramGroupFrom(chatId, messageThreadId)
+          : `telegram:${chatId}`,
+        To: `telegram:${chatId}`,
+        SessionKey: route.sessionKey,
+        AccountId: route.accountId,
+        ChatType: isGroup ? "group" : "direct",
+        GroupSubject: isGroup
+          ? (callbackQuery.message?.chat.title ?? undefined)
+          : undefined,
+        SenderName: senderName,
+        SenderId: senderId || undefined,
+        SenderUsername: senderUsername || undefined,
+        Provider: "telegram",
+        MessageSid: messageId ? String(messageId) : undefined,
+        Timestamp: Date.now(),
+        WasMentioned: isGroup ? true : undefined, // Treat button press as mention
+        CommandAuthorized: commandAuthorized,
+        MessageThreadId: messageThreadId,
+        IsForum: isForum,
+        // Button-specific context
+        CallbackData: data,
+        CallbackMessageId: messageId ? String(messageId) : undefined,
+      };
+
+      logVerbose(
+        `telegram callback: chatId=${chatId} from=${senderId} data="${data}"`,
+      );
+
+      const sendTyping = async () => {
+        try {
+          await bot.api.sendChatAction(
+            chatId,
+            "typing",
+            buildTelegramThreadParams(messageThreadId),
+          );
+        } catch (err) {
+          logVerbose(
+            `telegram typing cue failed for chat ${chatId}: ${String(err)}`,
+          );
+        }
+      };
+
+      const { dispatcher, replyOptions, markDispatchIdle } =
+        createReplyDispatcherWithTyping({
+          responsePrefix: cfg.messages?.responsePrefix,
+          deliver: async (payload) => {
+            await deliverReplies({
+              replies: [payload],
+              chatId: String(chatId),
+              token: opts.token,
+              runtime,
+              bot,
+              replyToMode,
+              textLimit,
+              messageThreadId,
+            });
+          },
+          onError: (err, info) => {
+            runtime.error?.(
+              danger(`telegram callback ${info.kind} reply failed: ${String(err)}`),
+            );
+          },
+          onReplyStart: sendTyping,
+        });
+
+      const { queuedFinal } = await dispatchReplyFromConfig({
+        ctx: ctxPayload,
+        cfg,
+        dispatcher,
+        replyOptions,
+      });
+      markDispatchIdle();
+      if (!queuedFinal) return;
+    } catch (err) {
+      runtime.error?.(danger(`callback_query handler failed: ${String(err)}`));
+    }
+  });
+
   const processMediaGroup = async (entry: MediaGroupEntry) => {
     try {
       entry.messages.sort((a, b) => a.msg.message_id - b.msg.message_id);
@@ -1174,7 +1347,7 @@ async function deliverReplies(params: {
   replyToMode: ReplyToMode;
   textLimit: number;
   messageThreadId?: number;
-}) {
+}): Promise<number | undefined> {
   const {
     replies,
     chatId,
@@ -1186,6 +1359,7 @@ async function deliverReplies(params: {
   } = params;
   const threadParams = buildTelegramThreadParams(messageThreadId);
   let hasReplied = false;
+  let lastMessageId: number | undefined;
   for (const reply of replies) {
     if (!reply?.text && !reply?.mediaUrl && !(reply?.mediaUrls?.length ?? 0)) {
       runtime.error?.(danger("reply missing text/media"));
@@ -1201,14 +1375,20 @@ async function deliverReplies(params: {
         ? [reply.mediaUrl]
         : [];
     if (mediaList.length === 0) {
-      for (const chunk of chunkMarkdownText(reply.text || "", textLimit)) {
-        await sendTelegramText(bot, chatId, chunk, runtime, {
+      const chunks = chunkMarkdownText(reply.text || "", textLimit);
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const isLastChunk = i === chunks.length - 1;
+        const msgId = await sendTelegramText(bot, chatId, chunk, runtime, {
           replyToMessageId:
             replyToId && (replyToMode === "all" || !hasReplied)
               ? replyToId
               : undefined,
           messageThreadId,
+          // Only add buttons to the last chunk
+          buttons: isLastChunk ? reply.buttons : undefined,
         });
+        if (msgId) lastMessageId = msgId;
         if (replyToId && !hasReplied) {
           hasReplied = true;
         }
@@ -1217,7 +1397,9 @@ async function deliverReplies(params: {
     }
     // media with optional caption on first item
     let first = true;
-    for (const mediaUrl of mediaList) {
+    for (let i = 0; i < mediaList.length; i++) {
+      const mediaUrl = mediaList[i];
+      const isLastMedia = i === mediaList.length - 1;
       const media = await loadWebMedia(mediaUrl);
       const kind = mediaKindFromMime(media.contentType ?? undefined);
       const isGif = isGifMedia({
@@ -1238,6 +1420,10 @@ async function deliverReplies(params: {
       };
       if (threadParams) {
         mediaParams.message_thread_id = threadParams.message_thread_id;
+      }
+      // Add buttons to the last media message
+      if (isLastMedia && reply.buttons && reply.buttons.length > 0) {
+        mediaParams.reply_markup = buildInlineKeyboard(reply.buttons);
       }
       if (isGif) {
         await bot.api.sendAnimation(chatId, file, {
@@ -1274,6 +1460,7 @@ async function deliverReplies(params: {
       }
     }
   }
+  return lastMessageId;
 }
 
 function buildTelegramThreadParams(messageThreadId?: number) {
@@ -1283,9 +1470,9 @@ function buildTelegramThreadParams(messageThreadId?: number) {
 }
 
 function resolveTelegramStreamMode(
-  telegramCfg: ClawdbotConfig["telegram"],
+  cfg: ReturnType<typeof loadConfig>,
 ): TelegramStreamMode {
-  const raw = telegramCfg?.streamMode?.trim().toLowerCase();
+  const raw = cfg.telegram?.streamMode?.trim().toLowerCase();
   if (raw === "off" || raw === "partial" || raw === "block") return raw;
   return "partial";
 }
@@ -1425,12 +1612,30 @@ async function resolveMedia(
   return { path: saved.path, contentType: saved.contentType, placeholder };
 }
 
+/**
+ * Build a grammY InlineKeyboard from button rows.
+ */
+function buildInlineKeyboard(buttons: InlineButtonRow[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const row of buttons) {
+    for (const button of row) {
+      keyboard.text(button.text, button.data);
+    }
+    keyboard.row();
+  }
+  return keyboard;
+}
+
 async function sendTelegramText(
   bot: Bot,
   chatId: string,
   text: string,
   runtime: RuntimeEnv,
-  opts?: { replyToMessageId?: number; messageThreadId?: number },
+  opts?: {
+    replyToMessageId?: number;
+    messageThreadId?: number;
+    buttons?: InlineButtonRow[];
+  },
 ): Promise<number | undefined> {
   const threadParams = buildTelegramThreadParams(opts?.messageThreadId);
   const baseParams: Record<string, unknown> = {
@@ -1440,6 +1645,10 @@ async function sendTelegramText(
     baseParams.message_thread_id = threadParams.message_thread_id;
   }
   const htmlText = markdownToTelegramHtml(text);
+  // Add inline keyboard if buttons are provided
+  if (opts?.buttons && opts.buttons.length > 0) {
+    baseParams.reply_markup = buildInlineKeyboard(opts.buttons);
+  }
   try {
     const res = await bot.api.sendMessage(chatId, htmlText, {
       parse_mode: "HTML",
