@@ -1,5 +1,7 @@
 import type { ReactionType, ReactionTypeEmoji } from "@grammyjs/types";
-import { type ApiClientOptions, Bot, InputFile } from "grammy";
+import { type ApiClientOptions, Bot, InlineKeyboard, InputFile } from "grammy";
+import { extractButtonTags } from "../auto-reply/reply/button-tags.js";
+import type { InlineButtonRow } from "../auto-reply/types.js";
 import { loadConfig } from "../config/config.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import type { RetryConfig } from "../infra/retry.js";
@@ -223,10 +225,15 @@ export async function sendMessageTelegram(
   if (!text || !text.trim()) {
     throw new Error("Message must be non-empty for Telegram sends");
   }
-  const htmlText = markdownToTelegramHtml(text);
-  const textParams = hasThreadParams
+  // Extract inline buttons from [[buttons]]..[[/buttons]] syntax
+  const { cleaned: cleanedText, buttons } = extractButtonTags(text);
+  const htmlText = markdownToTelegramHtml(cleanedText);
+  const textParams: Record<string, unknown> = hasThreadParams
     ? { parse_mode: "HTML" as const, ...threadParams }
     : { parse_mode: "HTML" as const };
+  if (buttons && buttons.length > 0) {
+    textParams.reply_markup = buildInlineKeyboard(buttons);
+  }
   const res = await request(
     () => api.sendMessage(chatId, htmlText, textParams),
     "message",
@@ -298,6 +305,20 @@ export async function reactMessageTelegram(
     "reaction",
   );
   return { ok: true };
+}
+
+/**
+ * Build an InlineKeyboard from button rows for the telegram tool.
+ */
+function buildInlineKeyboard(buttons: InlineButtonRow[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const row of buttons) {
+    for (const btn of row) {
+      keyboard.text(btn.text, btn.data);
+    }
+    keyboard.row();
+  }
+  return keyboard;
 }
 
 function inferFilename(kind: ReturnType<typeof mediaKindFromMime>) {
