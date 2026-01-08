@@ -51,6 +51,7 @@ import {
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { loadWebMedia } from "../web/media.js";
+import { resolveTelegramAccount } from "./accounts.js";
 import { createTelegramDraftStream } from "./draft-stream.js";
 import { resolveTelegramFetch } from "./fetch.js";
 import { markdownToTelegramHtml } from "./format.js";
@@ -163,14 +164,19 @@ export function createTelegramBot(opts: TelegramBotOptions) {
   const mediaGroupBuffer = new Map<string, MediaGroupEntry>();
 
   const cfg = opts.config ?? loadConfig();
-  const textLimit = resolveTextChunkLimit(cfg, "telegram");
-  const dmPolicy = cfg.telegram?.dmPolicy ?? "pairing";
-  const allowFrom = opts.allowFrom ?? cfg.telegram?.allowFrom;
+  const account = resolveTelegramAccount({
+    cfg,
+    accountId: opts.accountId,
+  });
+  const telegramCfg = account.config;
+  const textLimit = resolveTextChunkLimit(cfg, "telegram", account.accountId);
+  const dmPolicy = telegramCfg.dmPolicy ?? "pairing";
+  const allowFrom = opts.allowFrom ?? telegramCfg.allowFrom;
   const groupAllowFrom =
     opts.groupAllowFrom ??
-    cfg.telegram?.groupAllowFrom ??
-    (cfg.telegram?.allowFrom && cfg.telegram.allowFrom.length > 0
-      ? cfg.telegram.allowFrom
+    telegramCfg.groupAllowFrom ??
+    (telegramCfg.allowFrom && telegramCfg.allowFrom.length > 0
+      ? telegramCfg.allowFrom
       : undefined) ??
     (opts.allowFrom && opts.allowFrom.length > 0 ? opts.allowFrom : undefined);
   const normalizeAllowFrom = (list?: Array<string | number>) => {
@@ -210,15 +216,15 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       (entry) => entry === username || entry === `@${username}`,
     );
   };
-  const replyToMode = opts.replyToMode ?? cfg.telegram?.replyToMode ?? "off";
-  const streamMode = resolveTelegramStreamMode(cfg);
+  const replyToMode = opts.replyToMode ?? telegramCfg.replyToMode ?? "first";
+  const streamMode = resolveTelegramStreamMode(telegramCfg);
   const nativeEnabled = cfg.commands?.native === true;
   const nativeDisabledExplicit = cfg.commands?.native === false;
   const useAccessGroups = cfg.commands?.useAccessGroups !== false;
   const ackReaction = (cfg.messages?.ackReaction ?? "").trim();
   const ackReactionScope = cfg.messages?.ackReactionScope ?? "group-mentions";
   const mediaMaxBytes =
-    (opts.mediaMaxMb ?? cfg.telegram?.mediaMaxMb ?? 5) * 1024 * 1024;
+    (opts.mediaMaxMb ?? telegramCfg.mediaMaxMb ?? 5) * 1024 * 1024;
   const logger = getChildLogger({ module: "telegram-auto-reply" });
   const mentionRegexes = buildMentionRegexes(cfg);
   let botHasTopicsEnabled: boolean | undefined;
@@ -242,6 +248,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     resolveProviderGroupPolicy({
       cfg,
       provider: "telegram",
+      accountId: account.accountId,
       groupId: String(chatId),
     });
   const resolveGroupActivation = (params: {
@@ -269,6 +276,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     resolveProviderGroupRequireMention({
       cfg,
       provider: "telegram",
+      accountId: account.accountId,
       groupId: String(chatId),
       requireMentionOverride: opts.requireMention,
       overrideOrder: "after-config",
@@ -277,7 +285,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     chatId: string | number,
     messageThreadId?: number,
   ) => {
-    const groups = cfg.telegram?.groups;
+    const groups = telegramCfg.groups;
     if (!groups) return { groupConfig: undefined, topicConfig: undefined };
     const groupKey = String(chatId);
     const groupConfig = groups[groupKey] ?? groups["*"];
@@ -309,6 +317,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     const route = resolveAgentRoute({
       cfg,
       provider: "telegram",
+      accountId: account.accountId,
       peer: {
         kind: isGroup ? "group" : "dm",
         id: peerId,
@@ -848,7 +857,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         }
 
         if (isGroup && useAccessGroups) {
-          const groupPolicy = cfg.telegram?.groupPolicy ?? "open";
+          const groupPolicy = telegramCfg.groupPolicy ?? "open";
           if (groupPolicy === "disabled") {
             await bot.api.sendMessage(
               chatId,
@@ -915,6 +924,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         const route = resolveAgentRoute({
           cfg,
           provider: "telegram",
+          accountId: account.accountId,
           peer: {
             kind: isGroup ? "group" : "dm",
             id: isGroup
@@ -1043,7 +1053,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         // - "open" (default): groups bypass allowFrom, only mention-gating applies
         // - "disabled": block all group messages entirely
         // - "allowlist": only allow group messages from senders in groupAllowFrom/allowFrom
-        const groupPolicy = cfg.telegram?.groupPolicy ?? "open";
+        const groupPolicy = telegramCfg.groupPolicy ?? "open";
         if (groupPolicy === "disabled") {
           logVerbose(`Blocked telegram group message (groupPolicy: disabled)`);
           return;
@@ -1146,97 +1156,50 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     }
   });
 
-  // Handle inline button callbacks
+  // Handle inline button callback queries
   bot.on("callback_query:data", async (ctx) => {
     try {
-      const callbackQuery = ctx.callbackQuery;
-      const data = callbackQuery.data;
-      const chatId = callbackQuery.message?.chat.id;
-      const messageId = callbackQuery.message?.message_id;
-      const senderId = callbackQuery.from.id
-        ? String(callbackQuery.from.id)
-        : "";
-      const senderUsername = callbackQuery.from.username ?? "";
+      // Acknowledge the callback immediately to remove the "loading" state
+      await ctx.answerCallbackQuery();
 
-      if (!chatId) {
-        await ctx.answerCallbackQuery({ text: "Error: no chat context" });
-        return;
-      }
-
-      // Answer the callback with brief visual confirmation
-      await ctx.answerCallbackQuery({ text: `✓ ${data}` });
-
-      // Check access control
-      const storeAllowFrom = await readTelegramAllowFromStore().catch(() => []);
-      const isGroup =
-        callbackQuery.message?.chat.type === "group" ||
-        callbackQuery.message?.chat.type === "supergroup";
-      const effectiveAllow = normalizeAllowFrom([
-        ...(isGroup ? (groupAllowFrom ?? []) : (allowFrom ?? [])),
-        ...storeAllowFrom,
-      ]);
-
-      const commandAuthorized = isSenderAllowed({
-        allow: effectiveAllow,
-        senderId,
-        senderUsername,
-      });
-
-      if (!commandAuthorized && effectiveAllow.hasEntries) {
-        logVerbose(
-          `Blocked telegram callback from unauthorized sender ${senderId}`,
-        );
-        return;
-      }
-
-      const messageThreadId = (
-        callbackQuery.message as { message_thread_id?: number }
-      )?.message_thread_id;
+      const data = ctx.callbackQuery.data;
+      const msg = ctx.callbackQuery.message;
+      const chatId = ctx.chat?.id ?? msg?.chat.id;
+      const from = ctx.callbackQuery.from;
+      const messageId = msg?.message_id;
+      const messageThreadId =
+        msg && "message_thread_id" in msg ? msg.message_thread_id : undefined;
       const isForum =
-        (callbackQuery.message?.chat as { is_forum?: boolean })?.is_forum ===
-        true;
+        msg?.chat && "is_forum" in msg.chat ? msg.chat.is_forum : undefined;
 
-      // Build the callback body - treat button press as a message
-      const senderName =
-        [callbackQuery.from.first_name, callbackQuery.from.last_name]
-          .filter(Boolean)
-          .join(" ")
-          .trim() ||
-        callbackQuery.from.username ||
-        "Unknown";
+      if (!chatId || !data) return;
 
-      const body = formatAgentEnvelope({
-        provider: "Telegram",
-        from: isGroup
-          ? `${callbackQuery.message?.chat.title ?? `group:${chatId}`} from ${senderName} id:${senderId}`
-          : `${senderName} id:${senderId}`,
-        timestamp: Date.now(),
-        body: `[Button pressed: ${data}]`,
-      });
+      const isGroup =
+        msg?.chat.type === "group" || msg?.chat.type === "supergroup";
+      const senderId = from.id ? String(from.id) : undefined;
+      const senderUsername = from.username;
+      const senderFirstName = from.first_name || "";
+      const senderLastName = from.last_name || "";
+      const senderName = [senderFirstName, senderLastName]
+        .filter(Boolean)
+        .join(" ");
 
-      const route = resolveAgentRoute({
-        cfg,
-        provider: "telegram",
-        peer: {
-          kind: isGroup ? "group" : "dm",
-          id: isGroup
-            ? buildTelegramGroupPeerId(chatId, messageThreadId)
-            : String(chatId),
-        },
-      });
+      const groupPolicyResult = isGroup
+        ? resolveGroupPolicy({
+            chatId,
+            messageThreadId,
+          })
+        : undefined;
+      const commandAuthorized = groupPolicyResult?.isAllowed ?? true;
 
-      const ctxPayload = {
-        Body: body,
-        From: isGroup
-          ? buildTelegramGroupFrom(chatId, messageThreadId)
-          : `telegram:${chatId}`,
-        To: `telegram:${chatId}`,
-        SessionKey: route.sessionKey,
-        AccountId: route.accountId,
-        ChatType: isGroup ? "group" : "direct",
-        GroupSubject: isGroup
-          ? (callbackQuery.message?.chat.title ?? undefined)
-          : undefined,
+      // Build context for the button callback
+      const ctxPayload: TemplateContext = {
+        Body: data, // Use callback data as the message body
+        To: String(chatId),
+        From: senderId || undefined,
+        OriginatingChannel: "telegram",
+        OriginatingTo: String(chatId),
+        AccountId: account.accountId,
         SenderName: senderName,
         SenderId: senderId || undefined,
         SenderUsername: senderUsername || undefined,
@@ -1479,9 +1442,9 @@ function buildTelegramThreadParams(messageThreadId?: number) {
 }
 
 function resolveTelegramStreamMode(
-  cfg: ReturnType<typeof loadConfig>,
+  telegramCfg: ClawdbotConfig["telegram"],
 ): TelegramStreamMode {
-  const raw = cfg.telegram?.streamMode?.trim().toLowerCase();
+  const raw = telegramCfg?.streamMode?.trim().toLowerCase();
   if (raw === "off" || raw === "partial" || raw === "block") return raw;
   return "partial";
 }
@@ -1623,6 +1586,7 @@ async function resolveMedia(
 
 /**
  * Build a grammY InlineKeyboard from button rows.
+ * Each row is an array of buttons with text and callback_data.
  */
 function buildInlineKeyboard(buttons: InlineButtonRow[]): InlineKeyboard {
   const keyboard = new InlineKeyboard();
@@ -1653,11 +1617,11 @@ async function sendTelegramText(
   if (threadParams) {
     baseParams.message_thread_id = threadParams.message_thread_id;
   }
-  const htmlText = markdownToTelegramHtml(text);
   // Add inline keyboard if buttons are provided
   if (opts?.buttons && opts.buttons.length > 0) {
     baseParams.reply_markup = buildInlineKeyboard(opts.buttons);
   }
+  const htmlText = markdownToTelegramHtml(text);
   try {
     const res = await bot.api.sendMessage(chatId, htmlText, {
       parse_mode: "HTML",
