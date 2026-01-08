@@ -567,14 +567,15 @@ export async function runReplyAgent(params: {
       applyReplyToMode,
       currentMessageId: sessionCtx.MessageSid,
     })
-      .map((payload, index) => {
+      .map((payload, index, arr) => {
         const audioTagResult = extractAudioTag(payload.text);
         // Strip button syntax from text (buttons attached separately)
         let finalText = audioTagResult.cleaned;
         if (extractedButtons?.length) {
           finalText = stripButtonSyntaxFragments(finalText);
         }
-        const isLastPayload = index === sanitizedPayloads.length - 1;
+        // Use arr.length (the threaded/filtered array) not sanitizedPayloads.length
+        const isLastPayload = index === arr.length - 1;
         return {
           ...payload,
           text: finalText ? finalText : undefined,
