@@ -19,11 +19,12 @@ import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
-import type { TemplateContext } from "../templating.js";
+import type { OriginatingChannelType, TemplateContext } from "../templating.js";
 import { normalizeVerboseLevel, type VerboseLevel } from "../thinking.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { extractAudioTag } from "./audio-tags.js";
+import { extractButtonTags, stripButtonSyntaxFragments } from "./button-tags.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import {
   enqueueFollowupRun,
@@ -31,7 +32,6 @@ import {
   type QueueSettings,
   scheduleFollowupDrain,
 } from "./queue.js";
-import { extractButtonTags, stripButtonSyntaxFragments } from "./button-tags.js";
 import {
   applyReplyTagsToPayload,
   applyReplyThreading,
@@ -45,6 +45,7 @@ import {
 } from "./reply-threading.js";
 import { incrementCompactionCount } from "./session-updates.js";
 import type { TypingController } from "./typing.js";
+import { createTypingSignaler } from "./typing-mode.js";
 
 const BUN_FETCH_SOCKET_ERROR_RE = /socket connection was closed unexpectedly/i;
 
@@ -119,6 +120,11 @@ export async function runReplyAgent(params: {
   } = params;
 
   const isHeartbeat = opts?.isHeartbeat === true;
+  const typingSignals = createTypingSignaler({
+    typing,
+    mode: typingMode,
+    isHeartbeat,
+  });
   const shouldStartTypingOnText =
     typingMode === "message" || typingMode === "instant";
   const shouldStartTypingOnReasoning = typingMode === "thinking";
@@ -154,6 +160,17 @@ export async function runReplyAgent(params: {
     }
     return resolvedVerboseLevel === "on";
   };
+
+  const replyToChannel =
+    sessionCtx.OriginatingChannel ??
+    ((sessionCtx.Surface ?? sessionCtx.Provider)?.toLowerCase() as
+      | OriginatingChannelType
+      | undefined);
+  const replyToMode = resolveReplyToMode(
+    followupRun.run.config,
+    replyToChannel,
+  );
+  const applyReplyToMode = createReplyToModeFilter(replyToMode);
 
   const streamedPayloadKeys = new Set<string>();
   const pendingStreamedPayloadKeys = new Set<string>();

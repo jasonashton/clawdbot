@@ -13,6 +13,15 @@ export type GetReplyOptions = {
   skillFilter?: string[];
 };
 
+/** A single inline button with label and callback data */
+export type InlineButton = {
+  text: string;
+  data: string;
+};
+
+/** A row of inline buttons */
+export type InlineButtonRow = InlineButton[];
+
 export type ReplyPayload = {
   text?: string;
   mediaUrl?: string;
@@ -21,4 +30,6 @@ export type ReplyPayload = {
   /** Send audio as voice message (bubble) instead of audio file. Defaults to false. */
   audioAsVoice?: boolean;
   isError?: boolean;
+  /** Inline buttons to attach to this payload (Telegram only) */
+  buttons?: InlineButtonRow[];
 };

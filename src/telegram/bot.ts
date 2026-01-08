@@ -109,6 +109,7 @@ type TelegramContext = {
 
 export type TelegramBotOptions = {
   token: string;
+  accountId?: string;
   runtime?: RuntimeEnv;
   requireMention?: boolean;
   allowFrom?: Array<string | number>;
