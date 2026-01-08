@@ -24,7 +24,10 @@ import { normalizeVerboseLevel, type VerboseLevel } from "../thinking.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { extractAudioTag } from "./audio-tags.js";
-import { extractButtonTags, stripButtonSyntaxFragments } from "./button-tags.js";
+import {
+  extractButtonTags,
+  stripButtonSyntaxFragments,
+} from "./button-tags.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import {
   enqueueFollowupRun,
@@ -352,7 +355,11 @@ export async function runReplyAgent(params: {
                       return;
                     }
                     // Detect button syntax and stop streaming from this point
-                    if (text?.includes("[[buttons") || text?.includes("[[/buttons") || /\[[^\]|]+\|[^\]]+\]/.test(text || "")) {
+                    if (
+                      text?.includes("[[buttons") ||
+                      text?.includes("[[/buttons") ||
+                      /\[[^\]|]+\|[^\]]+\]/.test(text || "")
+                    ) {
                       detectedButtonSyntax = true;
                       return;
                     }
@@ -383,7 +390,9 @@ export async function runReplyAgent(params: {
                     const audioTagResult = extractAudioTag(taggedPayload.text);
                     // Also extract button tags to clean the text (buttons themselves
                     // are only sent with final payload, not during block streaming)
-                    const buttonResult = extractButtonTags(audioTagResult.cleaned);
+                    const buttonResult = extractButtonTags(
+                      audioTagResult.cleaned,
+                    );
                     const cleaned = buttonResult.cleaned || undefined;
                     const hasMedia =
                       Boolean(taggedPayload.mediaUrl) ||

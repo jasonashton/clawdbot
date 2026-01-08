@@ -1,6 +1,5 @@
 // @ts-nocheck
 import { Buffer } from "node:buffer";
-import fs from "node:fs";
 
 import { sequentialize } from "@grammyjs/runner";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
@@ -725,15 +724,15 @@ export function createTelegramBot(opts: TelegramBotOptions) {
             lastSentMessageId
           ) {
             try {
-              await bot.api.editMessageReplyMarkup(
-                chatId,
-                lastSentMessageId,
-                { reply_markup: buildInlineKeyboard(payload.buttons) },
-              );
+              await bot.api.editMessageReplyMarkup(chatId, lastSentMessageId, {
+                reply_markup: buildInlineKeyboard(payload.buttons),
+              });
               return;
             } catch (err) {
               // If edit fails, fall through to send as new message
-              runtime.log?.(`Failed to edit message for buttons: ${String(err)}`);
+              runtime.log?.(
+                `Failed to edit message for buttons: ${String(err)}`,
+              );
             }
           }
           const messageId = await deliverReplies({
@@ -1154,7 +1153,9 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       const data = callbackQuery.data;
       const chatId = callbackQuery.message?.chat.id;
       const messageId = callbackQuery.message?.message_id;
-      const senderId = callbackQuery.from.id ? String(callbackQuery.from.id) : "";
+      const senderId = callbackQuery.from.id
+        ? String(callbackQuery.from.id)
+        : "";
       const senderUsername = callbackQuery.from.username ?? "";
 
       if (!chatId) {
@@ -1188,16 +1189,21 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         return;
       }
 
-      const messageThreadId = (callbackQuery.message as { message_thread_id?: number })
-        ?.message_thread_id;
+      const messageThreadId = (
+        callbackQuery.message as { message_thread_id?: number }
+      )?.message_thread_id;
       const isForum =
-        (callbackQuery.message?.chat as { is_forum?: boolean })?.is_forum === true;
+        (callbackQuery.message?.chat as { is_forum?: boolean })?.is_forum ===
+        true;
 
       // Build the callback body - treat button press as a message
-      const senderName = [callbackQuery.from.first_name, callbackQuery.from.last_name]
-        .filter(Boolean)
-        .join(" ")
-        .trim() || callbackQuery.from.username || "Unknown";
+      const senderName =
+        [callbackQuery.from.first_name, callbackQuery.from.last_name]
+          .filter(Boolean)
+          .join(" ")
+          .trim() ||
+        callbackQuery.from.username ||
+        "Unknown";
 
       const body = formatAgentEnvelope({
         provider: "Telegram",
@@ -1281,7 +1287,9 @@ export function createTelegramBot(opts: TelegramBotOptions) {
           },
           onError: (err, info) => {
             runtime.error?.(
-              danger(`telegram callback ${info.kind} reply failed: ${String(err)}`),
+              danger(
+                `telegram callback ${info.kind} reply failed: ${String(err)}`,
+              ),
             );
           },
           onReplyStart: sendTyping,

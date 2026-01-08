@@ -14,6 +14,12 @@ patchedDependencies:
   '@mariozechner/pi-ai':
     hash: 574a0ebc3772ef61f04b6dcffdcda31c7fe6384e6f44ce43dbd7adb3b24ec97a
     path: patches/@mariozechner__pi-ai.patch
+  playwright-core@1.57.0:
+    hash: 66f1f266424dbe354068aaa5bba87bfb0e1d7d834a938c25dd70d43cdf1c1b02
+    path: patches/playwright-core@1.57.0.patch
+  qrcode-terminal:
+    hash: ed82029850dbdf551f5df1de320945af52b8ea8500cc7bd4f39258e7a3d92e12
+    path: patches/qrcode-terminal.patch
 
 importers:
 
@@ -31,6 +37,9 @@ importers:
       '@grammyjs/transformer-throttler':
         specifier: ^1.2.1
         version: 1.2.1(grammy@1.39.2)
+      '@grammyjs/types':
+        specifier: ^3.23.0
+        version: 3.23.0
       '@homebridge/ciao':
         specifier: ^1.3.4
         version: 1.3.4
@@ -111,13 +120,13 @@ importers:
         version: 0.2.0
       playwright-core:
         specifier: 1.57.0
-        version: 1.57.0
+        version: 1.57.0(patch_hash=66f1f266424dbe354068aaa5bba87bfb0e1d7d834a938c25dd70d43cdf1c1b02)
       proper-lockfile:
         specifier: ^4.1.2
         version: 4.1.2
       qrcode-terminal:
         specifier: ^0.12.0
-        version: 0.12.0
+        version: 0.12.0(patch_hash=ed82029850dbdf551f5df1de320945af52b8ea8500cc7bd4f39258e7a3d92e12)
       sharp:
         specifier: ^0.34.5
         version: 0.34.5
@@ -137,9 +146,6 @@ importers:
       '@biomejs/biome':
         specifier: ^2.3.11
         version: 2.3.11
-      '@grammyjs/types':
-        specifier: ^3.23.0
-        version: 3.23.0
       '@lit-labs/signals':
         specifier: ^0.2.0
         version: 0.2.0
@@ -5418,11 +5424,11 @@ snapshots:
     dependencies:
       pngjs: 7.0.0
 
-  playwright-core@1.57.0: {}
+  playwright-core@1.57.0(patch_hash=66f1f266424dbe354068aaa5bba87bfb0e1d7d834a938c25dd70d43cdf1c1b02): {}
 
   playwright@1.57.0:
     dependencies:
-      playwright-core: 1.57.0
+      playwright-core: 1.57.0(patch_hash=66f1f266424dbe354068aaa5bba87bfb0e1d7d834a938c25dd70d43cdf1c1b02)
     optionalDependencies:
       fsevents: 2.3.2
 
@@ -5504,7 +5510,7 @@ snapshots:
       '@thi.ng/bitstream': 2.4.37
     optional: true
 
-  qrcode-terminal@0.12.0: {}
+  qrcode-terminal@0.12.0(patch_hash=ed82029850dbdf551f5df1de320945af52b8ea8500cc7bd4f39258e7a3d92e12): {}
 
   qs@6.14.1:
     dependencies:
